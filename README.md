@@ -323,10 +323,6 @@ onnxruntime
 4. Add tests if applicable
 5. Submit a pull request
 
-## 📄 License
-
-This project is open source and available under the [MIT License](LICENSE).
-
 ## 🔮 Future Enhancements
 
 ### Model Development
@@ -342,14 +338,5 @@ This project is open source and available under the [MIT License](LICENSE).
 - [ ] Online learning capabilities
 - [ ] Data augmentation techniques
 - [ ] Integration with external car databases
-
-## 📞 Support
-
-For questions, issues, or contributions, please:
-- Open an issue on GitHub
-- Check the API documentation at `/docs`
-- Review the troubleshooting section
-
----
 
 **Built with ❤️ using FastAPI, scikit-learn, and ONNX**
