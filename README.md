@@ -73,7 +73,7 @@ car-price-prediction-model/
 
 1.  **Clone the repository**
     ```bash
-    git clone <repository-url>
+    git clone git@github.com:herdiagusthio/car-price-prediction-model.git
     cd car-price-prediction-model
     ```
 
