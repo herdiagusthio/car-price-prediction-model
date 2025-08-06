@@ -1,0 +1,12 @@
+
+fastapi
+uvicorn
+pandas
+numpy
+scikit-learn
+joblib
+skl2onnx
+onnx
+onnxruntime
+kaggle
+# Add other libraries if needed

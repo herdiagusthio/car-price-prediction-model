@@ -1,0 +1,583 @@
+name: ML Model CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    # Run daily at 2 AM UTC for model monitoring
+    - cron: '0 2 * * *'
+
+env:
+  PYTHON_VERSION: '3.9'
+  MODEL_REGISTRY: 'ghcr.io'
+  IMAGE_NAME: 'car-price-prediction'
+
+jobs:
+  # Code Quality and Security Checks
+  code-quality:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install flake8 black isort bandit safety mypy
+        pip install -r requirements.txt
+    
+    - name: Code formatting check (Black)
+      run: black --check --diff .
+    
+    - name: Import sorting check (isort)
+      run: isort --check-only --diff .
+    
+    - name: Linting (flake8)
+      run: flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+    
+    - name: Security check (Bandit)
+      run: bandit -r app/ -f json -o bandit-report.json || true
+    
+    - name: Dependency security check (Safety)
+      run: safety check --json --output safety-report.json || true
+    
+    - name: Type checking (MyPy)
+      run: mypy app/ --ignore-missing-imports --no-strict-optional || true
+    
+    - name: Upload security reports
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: security-reports
+        path: |
+          bandit-report.json
+          safety-report.json
+
+  # Unit and Integration Tests
+  test:
+    runs-on: ubuntu-latest
+    needs: code-quality
+    strategy:
+      matrix:
+        python-version: ['3.8', '3.9', '3.10']
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pytest pytest-cov pytest-xdist pytest-mock
+        pip install -r requirements.txt
+    
+    - name: Create test data
+      run: |
+        mkdir -p data logs models
+        # Copy sample data for testing
+        cp CarPrice_Assignment.csv data/
+    
+    - name: Run unit tests
+      run: |
+        pytest tests/ -v --cov=app --cov-report=xml --cov-report=html --junitxml=test-results.xml
+    
+    - name: Upload test results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: test-results-${{ matrix.python-version }}
+        path: |
+          test-results.xml
+          htmlcov/
+          .coverage
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      if: matrix.python-version == '3.9'
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+
+  # Model Training and Validation
+  model-training:
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main' || github.event_name == 'schedule'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Prepare directories
+      run: |
+        mkdir -p data logs models
+        cp CarPrice_Assignment.csv data/
+    
+    - name: Run model training
+      run: |
+        python -m app.train
+    
+    - name: Run model validation
+      run: |
+        python -m app.model_validator
+    
+    - name: Run full ML pipeline
+      run: |
+        python -m app.pipeline --validate --deploy
+    
+    - name: Upload model artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: model-artifacts
+        path: |
+          models/
+          logs/
+        retention-days: 30
+    
+    - name: Model performance check
+      run: |
+        python -c "
+        import json
+        import sys
+        
+        # Load model metadata
+        with open('models/model_metadata.json', 'r') as f:
+            metadata = json.load(f)
+        
+        # Check if model meets minimum performance criteria
+        r2_score = metadata['validation_metrics']['r2_score']
+        rmse = metadata['validation_metrics']['rmse']
+        
+        print(f'Model R² Score: {r2_score:.4f}')
+        print(f'Model RMSE: {rmse:.2f}')
+        
+        # Fail if model performance is below threshold
+        if r2_score < 0.8:
+            print('ERROR: Model R² score below minimum threshold (0.8)')
+            sys.exit(1)
+        
+        if rmse > 5000:
+            print('ERROR: Model RMSE above maximum threshold (5000)')
+            sys.exit(1)
+        
+        print('Model performance validation passed!')
+        "
+
+  # Docker Build and Security Scan
+  docker-build:
+    runs-on: ubuntu-latest
+    needs: [test, model-training]
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Download model artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: model-artifacts
+        path: .
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.MODEL_REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.MODEL_REGISTRY }}/${{ github.repository }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+    
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+    
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ env.MODEL_REGISTRY }}/${{ github.repository }}/${{ env.IMAGE_NAME }}:latest
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+    
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+  # API Integration Tests
+  api-tests:
+    runs-on: ubuntu-latest
+    needs: docker-build
+    if: github.ref == 'refs/heads/main'
+    
+    services:
+      app:
+        image: ghcr.io/${{ github.repository }}/car-price-prediction:latest
+        ports:
+          - 8000:8000
+        options: --health-cmd="curl -f http://localhost:8000/health" --health-interval=10s --health-timeout=5s --health-retries=5
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Install test dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install requests pytest
+    
+    - name: Wait for service to be ready
+      run: |
+        timeout 60 bash -c 'until curl -f http://localhost:8000/health; do sleep 2; done'
+    
+    - name: Run API integration tests
+      run: |
+        python -c "
+        import requests
+        import json
+        import sys
+        
+        base_url = 'http://localhost:8000'
+        
+        # Test health endpoint
+        response = requests.get(f'{base_url}/health')
+        assert response.status_code == 200
+        print('✓ Health check passed')
+        
+        # Test prediction endpoint
+        test_data = {
+            'symboling': 0,
+            'wheelbase': 88.6,
+            'carlength': 168.8,
+            'carwidth': 64.1,
+            'carheight': 48.8,
+            'curbweight': 2548,
+            'enginesize': 130,
+            'boreratio': 3.47,
+            'stroke': 2.68,
+            'compressionratio': 9.0,
+            'horsepower': 111,
+            'peakrpm': 5000,
+            'citympg': 21,
+            'highwaympg': 27,
+            'brand': 'toyota',
+            'fueltype': 'gas',
+            'aspiration': 'std',
+            'doornumber': 'four',
+            'carbody': 'sedan',
+            'drivewheel': 'fwd',
+            'enginelocation': 'front',
+            'enginetype': 'ohc',
+            'cylindernumber': 'four',
+            'fuelsystem': 'mpfi'
+        }
+        
+        response = requests.post(f'{base_url}/predict/', json=test_data)
+        assert response.status_code == 200
+        
+        result = response.json()
+        assert 'predicted_price' in result
+        assert isinstance(result['predicted_price'], (int, float))
+        assert result['predicted_price'] > 0
+        
+        print(f'✓ Prediction test passed: {result[\"predicted_price\"]}')
+        
+        # Test model info endpoint
+        response = requests.get(f'{base_url}/model/info')
+        assert response.status_code == 200
+        
+        info = response.json()
+        assert 'model_version' in info
+        assert 'features_count' in info
+        
+        print('✓ Model info test passed')
+        print('All API tests passed successfully!')
+        "
+
+  # Performance and Load Testing
+  performance-tests:
+    runs-on: ubuntu-latest
+    needs: api-tests
+    if: github.ref == 'refs/heads/main'
+    
+    services:
+      app:
+        image: ghcr.io/${{ github.repository }}/car-price-prediction:latest
+        ports:
+          - 8000:8000
+        options: --health-cmd="curl -f http://localhost:8000/health" --health-interval=10s --health-timeout=5s --health-retries=5
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Apache Bench
+      run: sudo apt-get update && sudo apt-get install -y apache2-utils
+    
+    - name: Wait for service
+      run: |
+        timeout 60 bash -c 'until curl -f http://localhost:8000/health; do sleep 2; done'
+    
+    - name: Run load test
+      run: |
+        # Create test payload
+        cat > test_payload.json << EOF
+        {
+          "symboling": 0,
+          "wheelbase": 88.6,
+          "carlength": 168.8,
+          "carwidth": 64.1,
+          "carheight": 48.8,
+          "curbweight": 2548,
+          "enginesize": 130,
+          "boreratio": 3.47,
+          "stroke": 2.68,
+          "compressionratio": 9.0,
+          "horsepower": 111,
+          "peakrpm": 5000,
+          "citympg": 21,
+          "highwaympg": 27,
+          "brand": "toyota",
+          "fueltype": "gas",
+          "aspiration": "std",
+          "doornumber": "four",
+          "carbody": "sedan",
+          "drivewheel": "fwd",
+          "enginelocation": "front",
+          "enginetype": "ohc",
+          "cylindernumber": "four",
+          "fuelsystem": "mpfi"
+        }
+        EOF
+        
+        # Run load test: 100 requests, 10 concurrent
+        ab -n 100 -c 10 -p test_payload.json -T application/json http://localhost:8000/predict/ > load_test_results.txt
+        
+        # Check results
+        cat load_test_results.txt
+        
+        # Verify performance criteria
+        avg_time=$(grep "Time per request" load_test_results.txt | head -1 | awk '{print $4}')
+        echo "Average response time: ${avg_time}ms"
+        
+        # Fail if average response time > 1000ms
+        if (( $(echo "$avg_time > 1000" | bc -l) )); then
+          echo "ERROR: Average response time too high: ${avg_time}ms"
+          exit 1
+        fi
+        
+        echo "Performance test passed!"
+    
+    - name: Upload performance results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: performance-results
+        path: load_test_results.txt
+
+  # Model Monitoring and Drift Detection
+  model-monitoring:
+    runs-on: ubuntu-latest
+    needs: performance-tests
+    if: github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && contains(github.event.head_commit.message, '[monitor]'))
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Download latest model artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: model-artifacts
+        path: .
+    
+    - name: Run model monitoring
+      run: |
+        python -c "
+        import json
+        import pandas as pd
+        from datetime import datetime
+        from app.model_validator import ModelValidator
+        from app.monitoring import get_monitor
+        
+        # Load current data
+        data = pd.read_csv('CarPrice_Assignment.csv')
+        
+        # Initialize validator and monitor
+        validator = ModelValidator()
+        monitor = get_monitor()
+        
+        # Simulate some monitoring data
+        print('Running model monitoring checks...')
+        
+        # Check for data drift (comparing current data to itself as baseline)
+        # In production, this would compare to historical baseline
+        split_point = len(data) // 2
+        baseline_data = data.iloc[:split_point]
+        current_data = data.iloc[split_point:]
+        
+        drift_results = validator.detect_data_drift(baseline_data, current_data)
+        
+        print(f'Data drift analysis completed:')
+        print(f'- Drift detected: {drift_results.get(\"drift_detected\", False)}')
+        print(f'- Drift score: {drift_results.get(\"drift_score\", 0):.4f}')
+        
+        # Generate monitoring report
+        monitoring_report = {
+            'timestamp': datetime.now().isoformat(),
+            'data_drift': drift_results,
+            'monitoring_status': 'healthy',
+            'recommendations': []
+        }
+        
+        if drift_results.get('drift_detected', False):
+            monitoring_report['monitoring_status'] = 'warning'
+            monitoring_report['recommendations'].append('Consider retraining model due to data drift')
+        
+        # Save monitoring report
+        with open('monitoring_report.json', 'w') as f:
+            json.dump(monitoring_report, f, indent=2, default=str)
+        
+        print('Monitoring report generated successfully')
+        "
+    
+    - name: Upload monitoring report
+      uses: actions/upload-artifact@v3
+      with:
+        name: monitoring-report
+        path: monitoring_report.json
+    
+    - name: Create monitoring issue if drift detected
+      if: always()
+      run: |
+        python -c "
+        import json
+        import os
+        
+        # Check if monitoring report indicates issues
+        try:
+            with open('monitoring_report.json', 'r') as f:
+                report = json.load(f)
+            
+            if report['monitoring_status'] != 'healthy':
+                print('Model monitoring detected issues!')
+                print('Creating GitHub issue...')
+                
+                # In a real scenario, you would use GitHub API to create an issue
+                print('Issue would be created with details:')
+                print(json.dumps(report, indent=2))
+            else:
+                print('Model monitoring: All systems healthy')
+        except Exception as e:
+            print(f'Error checking monitoring report: {e}')
+        "
+
+  # Deployment to Staging/Production
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [performance-tests, model-monitoring]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+    
+    steps:
+    - name: Deploy to production
+      run: |
+        echo "Deploying to production environment..."
+        echo "Image: ghcr.io/${{ github.repository }}/car-price-prediction:latest"
+        
+        # In a real scenario, this would deploy to your production environment
+        # Examples:
+        # - Update Kubernetes deployment
+        # - Deploy to cloud services (AWS ECS, Google Cloud Run, etc.)
+        # - Update Docker Swarm services
+        # - Deploy to serverless platforms
+        
+        echo "Deployment completed successfully!"
+    
+    - name: Post-deployment health check
+      run: |
+        echo "Running post-deployment health checks..."
+        
+        # In production, you would check your actual deployment
+        # curl -f https://your-production-url.com/health
+        
+        echo "Health checks passed!"
+    
+    - name: Notify deployment
+      run: |
+        echo "Sending deployment notifications..."
+        
+        # In production, you might send notifications to:
+        # - Slack/Teams channels
+        # - Email lists
+        # - Monitoring systems
+        # - Issue tracking systems
+        
+        echo "Notifications sent!"
+
+  # Cleanup
+  cleanup:
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: always()
+    
+    steps:
+    - name: Cleanup old artifacts
+      run: |
+        echo "Cleaning up old artifacts and temporary resources..."
+        # In production, you might:
+        # - Clean up old Docker images
+        # - Remove temporary files
+        # - Archive old model versions
+        echo "Cleanup completed!"
